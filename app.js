@@ -22,6 +22,7 @@ const state = {
   resolution: 7,
   h3ToLayer: new Map(),
   geoLayer: null,
+  maskLayer: null,
   selectedLayer: null,
   locationMarker: null,
   chart: null,
@@ -90,6 +91,38 @@ function addGeoLayer(geojson) {
       });
     },
   }).addTo(state.map);
+}
+
+// Opaque mask: hide the basemap everywhere OUTSIDE the hex grid, so only the
+// Jakarta study area shows map tiles. Each hex ring becomes a hole in a
+// world-covering polygon (Leaflet's default evenodd fill-rule cuts them out);
+// a dedicated pane keeps the mask above the tiles but below the hex layer.
+// Also frames the grid and bounds panning so the view can't wander off Jakarta.
+function addGridMask() {
+  if (!state.geoLayer) return;
+  const holes = [];
+  state.geoLayer.eachLayer((layer) => {
+    const rings = layer.getLatLngs();
+    if (rings && rings[0]) holes.push(rings[0]);
+  });
+  const world = [[-85, -180], [-85, 180], [85, 180], [85, -180]];
+
+  if (!state.map.getPane("maskPane")) {
+    const pane = state.map.createPane("maskPane");
+    pane.style.zIndex = 350; // tilePane(200) < maskPane(350) < overlayPane(400)
+    pane.style.pointerEvents = "none";
+  }
+  state.maskLayer = L.polygon([world, ...holes], {
+    pane: "maskPane",
+    stroke: false,
+    fillColor: "#e9eef3",
+    fillOpacity: 1,
+    interactive: false,
+  }).addTo(state.map);
+
+  const b = state.geoLayer.getBounds();
+  state.map.fitBounds(b);
+  state.map.setMaxBounds(b.pad(0.5));
 }
 
 // ---------------------------------------------------------------------------
@@ -291,15 +324,48 @@ function wireControls() {
   document.getElementById("mode-current").addEventListener("click", () => setMode("current"));
   document.getElementById("mode-other").addEventListener("click", () => setMode("other"));
 
-  document.getElementById("locate-btn").addEventListener("click", () => {
-    if (!navigator.geolocation) { alert("Geolocation is not supported by this browser."); return; }
+  const locateBtn = document.getElementById("locate-btn");
+  const locateHint = document.getElementById("locate-hint");
+  const setLocateHint = (msg, isErr) => {
+    locateHint.textContent = msg;
+    locateHint.classList.toggle("warn", !!isErr);
+  };
+
+  locateBtn.addEventListener("click", () => {
+    if (!navigator.geolocation) {
+      setLocateHint("Geolocation isn't supported by this browser — use the Lat / lon option.", true);
+      return;
+    }
+    const original = locateBtn.textContent;
+    locateBtn.disabled = true;
+    locateBtn.textContent = "Locating…";
+    setLocateHint("Requesting your location…", false);
+
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        state.map.setView([pos.coords.latitude, pos.coords.longitude], Math.max(state.map.getZoom(), 12));
-        selectByLatLng(pos.coords.latitude, pos.coords.longitude);
+        locateBtn.disabled = false;
+        locateBtn.textContent = original;
+        const { latitude: lat, longitude: lng } = pos.coords;
+        selectByLatLng(lat, lng); // resolves the hex cell + shows the (pending) readout
+        const cell = h3.latLngToCell(lat, lng, state.resolution);
+        if (state.h3ToLayer.has(cell)) {
+          state.map.setView([lat, lng], Math.max(state.map.getZoom(), 13));
+          setLocateHint("Showing the hex cell at your location.", false);
+        } else {
+          if (state.geoLayer) state.map.fitBounds(state.geoLayer.getBounds());
+          setLocateHint("You're outside the Jakarta study grid — showing the covered area.", true);
+        }
       },
-      (err) => alert("Could not get your location: " + err.message),
-      { enableHighAccuracy: true, timeout: 10000 }
+      (err) => {
+        locateBtn.disabled = false;
+        locateBtn.textContent = original;
+        const reason = { 1: "permission denied", 2: "position unavailable", 3: "request timed out" };
+        let msg = "Couldn't get your location (" + (reason[err.code] || err.message) + ").";
+        if (!window.isSecureContext) msg += " Location needs HTTPS or localhost.";
+        msg += " Try the Lat / lon option.";
+        setLocateHint(msg, true);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
   });
 
@@ -336,6 +402,7 @@ async function boot() {
 
   initMap();
   addGeoLayer(geojson);
+  addGridMask();
   renderLegend();
   renderBanner();
   renderAbout();
